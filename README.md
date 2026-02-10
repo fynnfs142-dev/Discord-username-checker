@@ -1,5 +1,7 @@
 # reaper checker
 
+![screenshot](screenshot.png)
+
 checks discord usernames. put names in names.txt (one per line), run the script, pick option 2 or 3. thats it.
 
 if names.txt is empty itll ask how many letters you want and generate all combos (3 = aaa to zzz etc).
@@ -32,4 +34,3 @@ then pick:
 - by @wgpf, @fdpw, @jvck
 
 discord: https://discord.gg/XWbjStSz5b
-****
