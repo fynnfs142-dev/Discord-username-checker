@@ -30,7 +30,7 @@ then pick:
 
 ## credits
 
-- https://github.com/diactine
+- https://github.com/wgfn
 - by @wgpf, @fdpw, @jvck
 
 discord: https://discord.gg/XWbjStSz5b
