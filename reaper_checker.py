@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import threading
 import time
@@ -119,7 +120,7 @@ def show_menu() -> str:
     """Show options and return '1', '2', or '3'."""
     print()
     print(purple("  [1] Discord"))
-    print(purple("  [2] Start Checker"))
+    print(purple("  [2] Watch (monitor single username)"))
     print(purple("  [3] Start Checker Fast"))
     print()
     choice = input(purple("Select option (1/2/3): ")).strip()
@@ -144,6 +145,36 @@ def red(text: str) -> str:
     return text
 
 
+def load_config(config_path: Path) -> dict:
+    """Load config from config.json, create if doesn't exist."""
+    if not config_path.exists():
+        # Create default config
+        default_config = {
+            "webhook": ""
+        }
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(default_config, f, indent=4)
+        print(purple(f"[+] Created {config_path.name}"))
+        return default_config
+    
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        return config
+    except Exception as e:
+        print(red(f"[!] Error loading config: {e}"))
+        return {"webhook": ""}
+
+
+def save_config(config_path: Path, config: dict):
+    """Save config to config.json."""
+    try:
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        print(red(f"[!] Error saving config: {e}"))
+
+
 def ensure_file(path: Path):
     if not path.exists():
         path.touch()
@@ -162,10 +193,23 @@ def write_names(names_path: Path, names_iter):
             f.write(name + "\n")
 
 
+def remove_name_from_file(names_path: Path, username: str, file_lock: threading.Lock):
+    """Remove a single username from names.txt in a thread-safe way."""
+    with file_lock:
+        try:
+            names = read_names(names_path)
+            updated = [n for n in names if n != username]
+            write_names(names_path, updated)
+        except Exception as e:
+            pass  # Don't crash the checker if file write fails
+
+
 def prompt_combination_length():
     while True:
         try:
-            value = input(purple("[?] No names found. How many letters per combination? ")).strip()
+            value = input(purple("[?] No names found. How many letters per combination? (default 4): ")).strip()
+            if not value:
+                return 4
             length = int(value)
             if length <= 0:
                 print(purple("[!] Please enter a positive number."))
@@ -176,8 +220,33 @@ def prompt_combination_length():
 
 
 def generate_combinations(length: int):
-    alphabet = "abcdefghijklmnopqrstuvwxyz"
-    return ("".join(chars) for chars in itertools.product(alphabet, repeat=length))
+    """Generate pronounceable combinations using consonant-vowel patterns."""
+    vowels = "aeiou"
+    consonants = "bcdfghjklmnpqrstvwxyz"
+    
+    if length == 4:
+        # For 4-letter names, use patterns like CVCC (jvck, jfck)
+        # Patterns: CVCC, CCVC, CVCV
+        patterns = [
+            [consonants, vowels, consonants, consonants],  # CVCC (like jvck)
+            [consonants, consonants, vowels, consonants],  # CCVC (like stop)
+            [consonants, vowels, consonants, vowels],      # CVCV (like mama)
+        ]
+        
+        for pattern in patterns:
+            for combo in itertools.product(*pattern):
+                yield "".join(combo)
+    else:
+        # For other lengths, alternate consonants and vowels
+        pattern = []
+        for i in range(length):
+            if i % 2 == 0:
+                pattern.append(consonants)
+            else:
+                pattern.append(vowels)
+        
+        for combo in itertools.product(*pattern):
+            yield "".join(combo)
 
 
 def scrape_proxies(proxies_path: Path):
@@ -258,9 +327,12 @@ def remove_proxy(proxies: list, proxy: str, proxies_path: Path | None = None, lo
         if proxy and proxy in proxies:
             proxies.remove(proxy)
             if proxies_path is not None and proxies_path.exists():
-                with proxies_path.open("w", encoding="utf-8") as f:
-                    for p in proxies:
-                        f.write(p + "\n")
+                try:
+                    with proxies_path.open("w", encoding="utf-8") as f:
+                        for p in proxies:
+                            f.write(p + "\n")
+                except Exception:
+                    pass  # Don't crash if file write fails
 
 
 def check_username(
@@ -270,21 +342,29 @@ def check_username(
     proxies_path: Path | None,
     timeout: int = 30,
     proxy_lock: threading.Lock | None = None,
+    max_retries: int = 5,
 ):
     """
     Check Discord username availability via the public /unique-username/username-attempt-unauthed endpoint.
     Failing proxies are removed from the list and from proxies.txt.
+    
+    FIX: Added max_retries to prevent infinite loops when all proxies fail.
     """
     if requests is None:
         return False, "requests_not_installed"
 
     lock = proxy_lock or threading.Lock()
-    while True:
+    retry_count = 0
+    
+    while retry_count < max_retries:
         proxy = None
         try:
             with lock:
                 if proxies:
                     proxy = get_next_proxy(proxies, proxy_index_ref)
+                else:
+                    # FIX: If no proxies available, try without proxy
+                    proxy = None
 
             proxy_dict = None
             if proxy:
@@ -303,10 +383,10 @@ def check_username(
                 try:
                     data = resp.json()
                 except Exception:
-                    return False, f"bad_json:{resp.text}"
+                    return False, f"bad_json:{resp.text[:100]}"
 
                 if "taken" not in data:
-                    return False, f"no_taken_field:{data}"
+                    return False, f"no_taken_field"
 
                 if data["taken"]:
                     return False, "taken"
@@ -318,28 +398,49 @@ def check_username(
                     retry_after = float(data.get("retry_after", 1.0))
                 except Exception:
                     retry_after = 1.0
+                
+                retry_after = min(retry_after, 60.0)
                 time.sleep(retry_after)
+                retry_count += 1
                 continue
 
-            return False, f"http_{resp.status_code}"
+            if 400 <= resp.status_code < 500:
+                return False, f"http_{resp.status_code}"
+            
+            retry_count += 1
+            continue
 
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectionError,
-                requests.exceptions.ReadTimeout):
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.Timeout) as e:
             if proxy is not None and proxies:
                 remove_proxy(proxies, proxy, proxies_path, lock=lock)
+            
+            retry_count += 1
+            
             with lock:
-                if not proxies:
-                    return False, "no_proxies_left"
+                if not proxies and retry_count >= max_retries:
+                    return False, "no_proxies_available"
+            
+            time.sleep(0.5)
             continue
+            
         except Exception as e:
-            return False, f"error:{e}"
+            retry_count += 1
+            if retry_count >= max_retries:
+                return False, f"error:{str(e)[:100]}"
+            time.sleep(0.5)
+            continue
+    
+    return False, "max_retries_exceeded"
 
 
 def run_checker(fast: bool = False):
     script_dir = Path(__file__).resolve().parent
     names_path = script_dir / "names.txt"
     proxies_path = script_dir / "proxies.txt"
+    config_path = script_dir / "config.json"
 
     print(purple(ASCII_REAPER))
     print(purple("=== Reaper Discord Username Checker ==="))
@@ -347,7 +448,28 @@ def run_checker(fast: bool = False):
     print(purple("by @wgpf, @fdpw, @jvck"))
     print()
 
-    webhook_url = input(purple("discord webhook for valid names (leave blank to skip): ")).strip()
+    # Load config
+    config = load_config(config_path)
+    
+    # Get webhook URL
+    saved_webhook = config.get("webhook", "")
+    if saved_webhook:
+        print(purple(f"[*] Loaded webhook from config: {saved_webhook[:50]}..."))
+        use_saved = input(purple("Use saved webhook? (y/n, default y): ")).strip().lower()
+        if use_saved in ("", "y", "yes"):
+            webhook_url = saved_webhook
+        else:
+            webhook_url = input(purple("Enter new discord webhook (leave blank to skip): ")).strip()
+            if webhook_url:
+                config["webhook"] = webhook_url
+                save_config(config_path, config)
+                print(purple("[+] Webhook saved to config.json"))
+    else:
+        webhook_url = input(purple("Discord webhook for valid names (leave blank to skip): ")).strip()
+        if webhook_url:
+            config["webhook"] = webhook_url
+            save_config(config_path, config)
+            print(purple("[+] Webhook saved to config.json"))
 
     results_dir = script_dir / "results"
     results_dir.mkdir(exist_ok=True)
@@ -357,8 +479,15 @@ def run_checker(fast: bool = False):
     names = read_names(names_path)
     if not names:
         length = prompt_combination_length()
-        print(purple(f"[*] Generating combinations with length {length}..."))
+        print(purple(f"[*] Generating pronounceable combinations with length {length}..."))
         combos = generate_combinations(length)
+        
+        # Count total combinations for user info
+        if length == 4:
+            # 3 patterns × their sizes
+            total = (21 * 5 * 21 * 21) + (21 * 21 * 5 * 21) + (21 * 5 * 21 * 5)
+            print(purple(f"[*] This will generate approximately {total:,} pronounceable names"))
+        
         write_names(names_path, combos)
         names = read_names(names_path)
         print(purple(f"[+] Generated {len(names)} names into {names_path.name}"))
@@ -367,11 +496,16 @@ def run_checker(fast: bool = False):
 
     proxies = load_proxies(proxies_path)
     print(purple(f"[*] Loaded {len(proxies)} proxies from {proxies_path.name}"))
+    
+    original_proxy_count = len(proxies)
 
     proxy_index_ref: dict = {"i": 0}
     proxy_lock = threading.Lock()
+    # Separate lock for names.txt file writes to avoid conflicts with proxy_lock
+    names_file_lock = threading.Lock()
     valid_counter = {"count": 0}
     invalid_counter = {"count": 0}
+    error_counter = {"count": 0}
     print_lock = threading.Lock()
 
     stop_event = threading.Event()
@@ -379,58 +513,234 @@ def run_checker(fast: bool = False):
     title_thread.start()
 
     def process_one(username: str):
-        available, status = check_username(
-            username, proxies, proxy_index_ref, proxies_path,
-            timeout=25 if fast else 30,
-            proxy_lock=proxy_lock,
-        )
-        return username, available, status
+        try:
+            available, status = check_username(
+                username, proxies, proxy_index_ref, proxies_path,
+                timeout=25 if fast else 30,
+                proxy_lock=proxy_lock,
+                max_retries=5 if fast else 3,
+            )
+            return username, available, status
+        except Exception as e:
+            return username, False, f"exception:{str(e)[:100]}"
 
     def do_result(username: str, available: bool, status: str):
         if available:
             valid_counter["count"] += 1
             with print_lock:
                 print(green(f"[VALID ] {username}"))
-            with proxy_lock:
-                with hits_path.open("a", encoding="utf-8") as f:
-                    f.write(username + "\n")
+            try:
+                with proxy_lock:
+                    with hits_path.open("a", encoding="utf-8") as f:
+                        f.write(username + "\n")
+            except Exception as e:
+                with print_lock:
+                    print(red(f"[ERROR] Failed to write to hits.txt: {e}"))
+            
             if webhook_url:
-                send_webhook(webhook_url, username)
+                try:
+                    send_webhook(webhook_url, username)
+                except Exception:
+                    pass
         else:
+            if "error" in status or "exception" in status or "max_retries" in status:
+                error_counter["count"] += 1
             invalid_counter["count"] += 1
             with print_lock:
                 print(red(f"[INVALID] {username} ({status})"))
+            # Remove invalid name from names.txt so the list shrinks as we check
+            remove_name_from_file(names_path, username, names_file_lock)
 
     try:
         if fast:
             max_workers = min(10, max(2, len(proxies) // 2)) if proxies else 4
             print(purple(f"[*] Fast mode: checking up to {max_workers} names at a time"))
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_one, name): name for name in names}
+                completed = 0
+                total = len(names)
+                
                 for fut in as_completed(futures):
                     try:
-                        username, available, status = fut.result()
+                        username, available, status = fut.result(timeout=60)
                         do_result(username, available, status)
+                        completed += 1
+                        
+                        if completed % 10 == 0:
+                            with print_lock:
+                                remaining_proxies = len(proxies)
+                                print(purple(f"[*] Progress: {completed}/{total} | Proxies: {remaining_proxies}/{original_proxy_count} | Errors: {error_counter['count']}"))
+                        
                     except Exception as e:
                         with print_lock:
                             print(red(f"[ERROR] {futures[fut]} - {e}"))
                         invalid_counter["count"] += 1
+                        error_counter["count"] += 1
         else:
-            for username in names:
-                _, available, status = process_one(username)
-                do_result(username, available, status)
-                time.sleep(0.3)
+            total = len(names)
+            for idx, username in enumerate(names, 1):
+                try:
+                    _, available, status = process_one(username)
+                    do_result(username, available, status)
+                    
+                    if idx % 10 == 0:
+                        with print_lock:
+                            remaining_proxies = len(proxies)
+                            print(purple(f"[*] Progress: {idx}/{total} | Proxies: {remaining_proxies}/{original_proxy_count} | Errors: {error_counter['count']}"))
+                    
+                    time.sleep(0.3)
+                except Exception as e:
+                    with print_lock:
+                        print(red(f"[ERROR] {username} - {e}"))
+                    invalid_counter["count"] += 1
+                    error_counter["count"] += 1
 
         print(purple("\n=== Done ==="))
         print(green(f"Valid  : {valid_counter['count']}"))
         print(red(f"Invalid: {invalid_counter['count']}"))
+        print(purple(f"Errors : {error_counter['count']}"))
         print(purple(f"Valid names saved to {hits_path}"))
+        print(purple(f"Proxies remaining: {len(proxies)}/{original_proxy_count}"))
+        
+    except KeyboardInterrupt:
+        print(purple("\n[!] Interrupted by user"))
     finally:
         stop_event.set()
         title_thread.join(timeout=2)
 
 
+def watch_username():
+    """Monitor a single username continuously until it becomes available or user stops."""
+    script_dir = Path(__file__).resolve().parent
+    proxies_path = script_dir / "proxies.txt"
+    config_path = script_dir / "config.json"
+
+    print(purple(ASCII_REAPER))
+    print(purple("=== Reaper Username Watch Mode ==="))
+    print(purple("https://github.com/diactine"))
+    print(purple("by @wgpf, @fdpw, @jvck"))
+    print()
+
+    # Get username to watch
+    username = input(purple("Enter username to watch: ")).strip()
+    if not username:
+        print(red("[!] No username provided"))
+        return
+
+    # Load config
+    config = load_config(config_path)
+    
+    # Get webhook URL
+    saved_webhook = config.get("webhook", "")
+    if saved_webhook:
+        print(purple(f"[*] Loaded webhook from config: {saved_webhook[:50]}..."))
+        use_saved = input(purple("Use saved webhook? (y/n, default y): ")).strip().lower()
+        if use_saved in ("", "y", "yes"):
+            webhook_url = saved_webhook
+        else:
+            webhook_url = input(purple("Enter new discord webhook (leave blank to skip): ")).strip()
+            if webhook_url:
+                config["webhook"] = webhook_url
+                save_config(config_path, config)
+                print(purple("[+] Webhook saved to config.json"))
+    else:
+        webhook_url = input(purple("Discord webhook for notifications (leave blank to skip): ")).strip()
+        if webhook_url:
+            config["webhook"] = webhook_url
+            save_config(config_path, config)
+            print(purple("[+] Webhook saved to config.json"))
+
+    # Get check interval
+    try:
+        interval_input = input(purple("Check interval in seconds (default 5): ")).strip()
+        check_interval = float(interval_input) if interval_input else 5.0
+        if check_interval < 1:
+            check_interval = 1.0
+            print(purple("[!] Minimum interval is 1 second"))
+    except ValueError:
+        check_interval = 5.0
+        print(purple("[!] Invalid interval, using default 5 seconds"))
+
+    # Load proxies
+    proxies = load_proxies(proxies_path)
+    print(purple(f"[*] Loaded {len(proxies)} proxies from {proxies_path.name}"))
+    original_proxy_count = len(proxies)
+
+    proxy_index_ref = {"i": 0}
+    proxy_lock = threading.Lock()
+    check_count = 0
+
+    print()
+    print(purple(f"[*] Watching username: {username}"))
+    print(purple(f"[*] Check interval: {check_interval}s"))
+    print(purple("[*] Press Ctrl+C to stop"))
+    print()
+
+    results_dir = script_dir / "results"
+    results_dir.mkdir(exist_ok=True)
+    hits_path = results_dir / "hits.txt"
+    ensure_file(hits_path)
+
+    try:
+        while True:
+            check_count += 1
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            try:
+                available, status = check_username(
+                    username, proxies, proxy_index_ref, proxies_path,
+                    timeout=30,
+                    proxy_lock=proxy_lock,
+                    max_retries=3,
+                )
+
+                if available:
+                    print(green(f"[{timestamp}] ✓ AVAILABLE! {username} is now available!"))
+                    print(green(f"[*] Username became available after {check_count} checks"))
+                    
+                    # Save to hits
+                    try:
+                        with hits_path.open("a", encoding="utf-8") as f:
+                            f.write(f"{username} - {timestamp}\n")
+                        print(purple(f"[+] Saved to {hits_path}"))
+                    except Exception as e:
+                        print(red(f"[!] Error saving: {e}"))
+                    
+                    # Send webhook
+                    if webhook_url:
+                        try:
+                            send_webhook(webhook_url, username)
+                            print(purple("[+] Webhook notification sent"))
+                        except Exception:
+                            pass
+                    
+                    print(purple("\n[*] Watch complete! Username is available."))
+                    break
+                else:
+                    remaining_proxies = len(proxies)
+                    status_display = status[:30] + "..." if len(status) > 30 else status
+                    print(red(f"[{timestamp}] Check #{check_count}: Not available ({status_display}) | Proxies: {remaining_proxies}/{original_proxy_count}"))
+                
+            except Exception as e:
+                print(red(f"[{timestamp}] Check #{check_count}: Error - {str(e)[:50]}"))
+            
+            # Wait before next check
+            time.sleep(check_interval)
+            
+    except KeyboardInterrupt:
+        print(purple(f"\n\n[!] Watch stopped by user after {check_count} checks"))
+        print(purple(f"[*] Username '{username}' was not available"))
+
+
+
 def main():
+    script_dir = Path(__file__).resolve().parent
+    config_path = script_dir / "config.json"
+    
+    # Load or create config on startup
+    load_config(config_path)
+    
     init_colors()
     play_fade_intro(duration=4.0, step=0.12)
     webbrowser.open(DISCORD_INVITE)
@@ -442,7 +752,7 @@ def main():
             print(purple(f"[*] Opening Discord: {DISCORD_INVITE}"))
             webbrowser.open(DISCORD_INVITE)
         elif choice == "2":
-            run_checker(fast=False)
+            watch_username()
             break
         elif choice == "3":
             run_checker(fast=True)
@@ -453,4 +763,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
